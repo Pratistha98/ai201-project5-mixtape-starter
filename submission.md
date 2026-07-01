@@ -89,6 +89,22 @@ if song.shared_by != user_id:
 
 The `song.shared_by != user_id` guard prevents self-notification, matching the sibling pattern. The `notification_type="song_rated"` string is new — no existing code compares against it, so it can be freely introduced (verified with `grep -rn "song_rated" .`). Side-effect check: ran the full test suite. `test_streaks.py` (5) and `test_search.py` (5) still pass. `test_playlists.py` shows two pre-existing failures from Bug 5, unrelated to this change. The `create_notification` helper is idempotent w.r.t. errors — it commits its own row inside a separate transaction step, so a notification failure would not roll back the rating write.
 
+### Bug 5 — The last song in a playlist never shows up
+
+**How I reproduced it.** The pre-written test `tests/test_playlists.py::test_playlist_returns_all_songs` builds a playlist of 5 tracks and asserts the returned titles are `["Track 1", "Track 2", "Track 3", "Track 4", "Track 5"]`. Running `pytest tests/test_playlists.py` before touching the code, it failed with `AssertionError: Right contains one more item: 'Track 5'` — the return value was missing exactly the last element. `test_playlist_returns_songs_in_order` failed for the same reason.
+
+**How I found the root cause.** Function-trace: `GET /playlists/<id>/songs` → `routes/playlists.py::get_songs` → `playlist_service.get_playlist_songs`. Read the function top-to-bottom. The SQLAlchemy query is correct: it joins `Song` to `playlist_entries`, filters by `playlist_id`, orders by `position`, and calls `.all()`. Nothing wrong there. Then the return line:
+
+```python
+return [song.to_dict() for song in songs[:-1]]
+```
+
+`songs[:-1]` is Python slice syntax for "all but the last element." That single character difference from `songs[:]` is what drops Track 5.
+
+**The root cause.** The list comprehension iterates over `songs[:-1]` instead of `songs`. Python's slice-with-negative-stop convention means the final element is excluded. There is no case where excluding the last item is desirable for this function — the docstring says "Get the ordered list of songs in a playlist" and there is no comment justifying the slice.
+
+**Fix and side-effect check.** Changed `songs[:-1]` to `songs` in `services/playlist_service.py:66`. Ran the entire `tests/` directory — all 13 tests pass across streaks, search, and playlists. `test_empty_playlist_returns_empty_list` still passes: the query returns an empty list on no matches, `[song.to_dict() for song in []]` is `[]`. `test_playlist_returns_songs_in_order` now passes since the `order_by(asc(position))` was already correct — the slice was the only obstacle.
+
 ## Codebase Map
 
 Mixtape is a Flask + SQLAlchemy backend for a social music app. Users share songs, rate them, build collaborative playlists, and see what their friends are listening to. Every route is JSON in / JSON out — there is no HTML/template layer.
