@@ -57,6 +57,38 @@ I read the query line by line. The `outerjoin(song_tags, …)` is never referenc
 
 **Fix and side-effect check.** Removed the `.outerjoin(...)` clause from `services/search_service.py` and dropped the now-unused `Tag, song_tags` imports. The query now selects songs matching title or artist without any join to `song_tags`. Ran `pytest tests/test_search.py` — all 5 tests still pass, including `test_search_no_duplicates_multi_tag_song`. Song tags are still populated in the response because `Song.tags` uses `lazy="subquery"`, which loads tags in a separate SELECT after the main query — that mechanism is untouched by removing the join. No other function calls the join or the imports I removed.
 
+### Bug 4 — I got notified when a friend added my song to a playlist but not when they rated it
+
+**How I reproduced it.** Traced the two endpoints against seed data mentally: `POST /playlists/<id>/songs` calls `add_to_playlist`, which does a `create_notification(...)` before returning. `POST /songs/<id>/rate` calls `rate_song`, which upserts the `Rating` and returns — with no notification call anywhere. The `seed_data.py` file confirms the pattern: line 168 creates a "song_added_to_playlist" notification as a working example, and the file has no equivalent for "song_rated" — because the code path never produces one.
+
+**How I found the root cause.** The hint in the project brief said the root cause is architectural, not a typo, and instructed comparing the working notification pattern line-by-line against the missing one. Both functions live in the same file (`services/notification_service.py`), so I opened `add_to_playlist` and `rate_song` side by side. In `add_to_playlist`, right after committing the playlist mutation:
+
+```python
+if song.shared_by != added_by_user_id:
+    create_notification(
+        user_id=song.shared_by,
+        notification_type="song_added_to_playlist",
+        body=f"{adder.username} added your song '{song.title}' to the playlist '{playlist.name}'.",
+    )
+```
+
+In `rate_song`, the corresponding position — right after `db.session.commit()` and before `return rating` — is empty. The commit happens, the rating is persisted, but nothing addresses the song's original sharer. That's the whole architectural miss: the entire notification block from the sibling function was never written.
+
+**The root cause.** `rate_song` in `services/notification_service.py` never calls `create_notification`. The service is named after notifications and owns the paired write for playlist adds, but the rate flow only writes the `Rating` row. There is no typo, no wrong argument, no bad condition — the call site simply doesn't exist. So `song.shared_by` is never told anyone rated their song.
+
+**Fix and side-effect check.** After `db.session.commit()` and before `return rating`, added the same guard-and-notify pattern used by `add_to_playlist`:
+
+```python
+if song.shared_by != user_id:
+    create_notification(
+        user_id=song.shared_by,
+        notification_type="song_rated",
+        body=f"{rater.username} rated your song '{song.title}' {score}/5.",
+    )
+```
+
+The `song.shared_by != user_id` guard prevents self-notification, matching the sibling pattern. The `notification_type="song_rated"` string is new — no existing code compares against it, so it can be freely introduced (verified with `grep -rn "song_rated" .`). Side-effect check: ran the full test suite. `test_streaks.py` (5) and `test_search.py` (5) still pass. `test_playlists.py` shows two pre-existing failures from Bug 5, unrelated to this change. The `create_notification` helper is idempotent w.r.t. errors — it commits its own row inside a separate transaction step, so a notification failure would not roll back the rating write.
+
 ## Codebase Map
 
 Mixtape is a Flask + SQLAlchemy backend for a social music app. Users share songs, rate them, build collaborative playlists, and see what their friends are listening to. Every route is JSON in / JSON out — there is no HTML/template layer.
