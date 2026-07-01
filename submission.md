@@ -21,6 +21,16 @@ else:
 
 **Fix and side-effect check.** Removed the `and today.weekday() != 6` half in `services/streak_service.py`. The increment branch now reads `elif days_since_last == 1:`, which matches the docstring rule "If the user listened yesterday: streak increments by 1." Ran the full `tests/test_streaks.py` suite — all 5 tests pass, including the 4 that were already passing (new user starts at 1, consecutive weekday increments, same-day no double count, skipped day resets). The `else` branch still handles gaps of >1 day, and the `days_since_last == 0` early return still handles same-day. No route or other service imports the weekday guard.
 
+### Bug 2 — Friends Listening Now shows people from yesterday
+
+**How I reproduced it.** No test file exists for the feed service, so I reproduced it by reasoning through the code with a concrete timestamp. The endpoint filters listening events where `listened_at >= now - RECENT_THRESHOLD`, and `RECENT_THRESHOLD` was `timedelta(hours=24)`. Concrete example: it's Monday 8:00 pm UTC, a friend listened Sunday 9:00 pm UTC (23 hours ago). Cutoff = Sunday 8:00 pm UTC. `Sunday 9pm >= Sunday 8pm` → True, so the friend appears in a feed labeled "listening now" on Monday evening. That friend hasn't opened the app since yesterday, but the UI shows them as currently listening — exactly the reported symptom.
+
+**How I found the root cause.** Function-trace: `GET /feed/<user_id>/listening-now` → `routes/feed.py::listening_now` → `feed_service.get_friends_listening_now`. Inside that function, the only piece of logic that decides who counts as "now" is `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`. Followed `RECENT_THRESHOLD` back to line 13 and saw it was 24 hours — that's obviously not "now." The query, dedup, and ordering logic all read correctly; only the constant was wrong. The moment I was confident: grepping `RECENT_THRESHOLD` across the whole project returned only two hits — the definition and the one use inside this function — so nothing else was leaning on that value.
+
+**The root cause.** `RECENT_THRESHOLD = timedelta(hours=24)` is not a "now" window. Anyone who listened at any point in the last 24 hours passed the filter, so friends whose most recent listen was yesterday (up to 23h59m ago) showed up in "listening now." A "now" feed needs a window measured in minutes, not hours — otherwise it can span calendar days.
+
+**Fix and side-effect check.** Changed the constant to `timedelta(minutes=30)` in `services/feed_service.py:13`. Thirty minutes is long enough to catch a song that just finished playing and short enough that it cannot cross midnight. Side-effect check: grepped `RECENT_THRESHOLD` — only used inside `get_friends_listening_now`. The neighboring `get_activity_feed` function deliberately has no time filter (its docstring says: *"Unlike get_friends_listening_now, this is not filtered by recency"*), so it's unaffected. The query, dedup-per-friend, and ordering-by-most-recent logic are unchanged.
+
 ## Codebase Map
 
 Mixtape is a Flask + SQLAlchemy backend for a social music app. Users share songs, rate them, build collaborative playlists, and see what their friends are listening to. Every route is JSON in / JSON out — there is no HTML/template layer.
