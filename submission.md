@@ -31,6 +31,32 @@ else:
 
 **Fix and side-effect check.** Changed the constant to `timedelta(minutes=30)` in `services/feed_service.py:13`. Thirty minutes is long enough to catch a song that just finished playing and short enough that it cannot cross midnight. Side-effect check: grepped `RECENT_THRESHOLD` — only used inside `get_friends_listening_now`. The neighboring `get_activity_feed` function deliberately has no time filter (its docstring says: *"Unlike get_friends_listening_now, this is not filtered by recency"*), so it's unaffected. The query, dedup-per-friend, and ordering-by-most-recent logic are unchanged.
 
+### Bug 3 — The same song keeps showing up twice in search
+
+**How I reproduced it.** The `seed_data.py` comment on line 73 makes the intent explicit: *"Songs with 3+ tags — these are the ones that expose Issue #3."* The pre-written test `tests/test_search.py::test_search_no_duplicates_multi_tag_song` sets up a song with three tags and asserts the search returns it exactly once (the comment reads: `# Should be 1, bug causes it to be 3`). I ran the raw SQL manually to see what the query actually produces:
+
+```
+SELECT song.* FROM song LEFT OUTER JOIN song_tags ON song.id = song_tags.song_id WHERE ...
+via raw execute: 3 rows
+```
+
+A song with three tags produces three rows from the join. The legacy `session.query(Song).all()` API happens to auto-deduplicate by primary key in this SQLAlchemy version, which is why the current tests pass — but the query is doing the wrong thing under the hood and would produce duplicates the moment anyone migrated to `session.execute(select(...))`, or relied on the raw result in any other way.
+
+**How I found the root cause.** Function-trace: `GET /songs/search?q=…` → `routes/songs.py::search` → `search_service.search_songs`. Inside `search_songs`, the query is a single expression:
+
+```python
+db.session.query(Song)
+  .outerjoin(song_tags, Song.id == song_tags.c.song_id)
+  .filter(db.or_(Song.title.ilike(...), Song.artist.ilike(...)))
+  .all()
+```
+
+I read the query line by line. The `outerjoin(song_tags, …)` is never referenced again — no filter uses it, no column from `song_tags` is selected, and the `Tag` and `song_tags` imports at the top of the file are otherwise unused. So the join has no functional role; its only observable effect is to fan the row count out to one row per tag per matching song. That's the mechanism that produces the duplicates the issue describes.
+
+**The root cause.** The `.outerjoin(song_tags, Song.id == song_tags.c.song_id)` clause causes the SQL engine to emit one row per song–tag pair. For a song with three tags, the raw result has three identical `song.*` rows; for a song with no tags, one row. The join is dead code — it serves no filter and contributes no data to the SELECT — but it multiplies rows. The legacy ORM Query API masks this at `.all()` time via identity-map deduplication, but the underlying SQL is still returning duplicates.
+
+**Fix and side-effect check.** Removed the `.outerjoin(...)` clause from `services/search_service.py` and dropped the now-unused `Tag, song_tags` imports. The query now selects songs matching title or artist without any join to `song_tags`. Ran `pytest tests/test_search.py` — all 5 tests still pass, including `test_search_no_duplicates_multi_tag_song`. Song tags are still populated in the response because `Song.tags` uses `lazy="subquery"`, which loads tags in a separate SELECT after the main query — that mechanism is untouched by removing the join. No other function calls the join or the imports I removed.
+
 ## Codebase Map
 
 Mixtape is a Flask + SQLAlchemy backend for a social music app. Users share songs, rate them, build collaborative playlists, and see what their friends are listening to. Every route is JSON in / JSON out — there is no HTML/template layer.
