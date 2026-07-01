@@ -1,5 +1,26 @@
 # Mixtape — Submission
 
+## Root Cause Analyses
+
+### Bug 1 — My listening streak keeps resetting
+
+**How I reproduced it.** The repo ships a pytest that already pins the bug down: `tests/test_streaks.py::test_streak_increments_on_sunday`. It sets up a user who listens on Saturday 2024-06-15 and again on Sunday 2024-06-16, then asserts the streak should be 2. Running `pytest tests/test_streaks.py -v` before touching any code, that test failed with `assert 1 == 2` — confirming the streak reset instead of incrementing on Sunday. The other four streak tests (new user, consecutive weekday, same-day double-count, skipped day) all passed, which narrowed the bug to the Sunday boundary specifically.
+
+**How I found the root cause.** Function-trace top-down: `POST /songs/<id>/listen` → `routes/songs.py::listen` → `streak_service.record_listening_event` → `streak_service.update_listening_streak(user, now)`. Only the last function actually mutates the streak, so that's where I stopped. Reading it, the branch that increments the streak had an extra guard tacked onto it:
+
+```python
+elif days_since_last == 1 and today.weekday() != 6:
+    user.listening_streak += 1
+else:
+    user.listening_streak = 1
+```
+
+`datetime.weekday()` returns `0=Monday … 6=Sunday`. The `!= 6` clause literally excludes Sunday from the "increment" branch. So Sat→Sun listens fell through to `else` and reset the counter. The moment I was sure this was the right place: the failing test uses exactly Saturday and Sunday dates with a comment `weekday() == 6`, so the test author was pointing at this line.
+
+**The root cause.** The increment branch was gated on `today.weekday() != 6`, which excludes Sunday. On any Saturday-then-Sunday sequence, `days_since_last == 1` was True but the `and today.weekday() != 6` half was False, so the streak took the `else` branch and reset to 1. There is no rule in the docstring that the streak should be week-bounded — the guard was simply wrong.
+
+**Fix and side-effect check.** Removed the `and today.weekday() != 6` half in `services/streak_service.py`. The increment branch now reads `elif days_since_last == 1:`, which matches the docstring rule "If the user listened yesterday: streak increments by 1." Ran the full `tests/test_streaks.py` suite — all 5 tests pass, including the 4 that were already passing (new user starts at 1, consecutive weekday increments, same-day no double count, skipped day resets). The `else` branch still handles gaps of >1 day, and the `days_since_last == 0` early return still handles same-day. No route or other service imports the weekday guard.
+
 ## Codebase Map
 
 Mixtape is a Flask + SQLAlchemy backend for a social music app. Users share songs, rate them, build collaborative playlists, and see what their friends are listening to. Every route is JSON in / JSON out — there is no HTML/template layer.
