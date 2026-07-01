@@ -1,5 +1,27 @@
 # Mixtape — Submission
 
+## AI Usage
+
+I used Claude Code as a reading partner throughout this project. Mostly to speed up navigation and to draft the RCA prose after I'd already figured out what was wrong.
+
+Where it helped:
+- Reading through `routes/`, `services/`, and `models.py` and summarizing what each file does. I still re-read models.py and each service myself before writing the codebase map — didn't want to submit something I couldn't defend.
+- Walking the call chain from route to service for each bug so I could describe the trace cleanly in the RCA.
+- Small setup stuff — port 5000 was in use, `python` on my machine pointed at Python 2, macOS `localhost` vs `127.0.0.1`. Faster than Googling.
+
+Where I had to push back:
+- For Bug 3 (search duplicates), I kept trying to reproduce the duplicate against the current code and couldn't — SQLAlchemy's legacy `session.query().all()` auto-dedupes by identity map, so the outerjoin was silently producing 3 rows in raw SQL but only 1 after `.all()`. I confirmed this by running `session.execute(query.statement).all()` and seeing 3 rows. The fix is still valid — the outerjoin serves no filter or select purpose — but the current tests happen to pass because of the dedup. I wrote the RCA honestly rather than pretending a test was failing.
+- Claude wanted to skip running tests between fixes. I made it run pytest each time so I had a real assertion to point at instead of guessing.
+
+What I checked myself:
+- Every diff was small enough to read. I confirmed each change matched what I expected before committing.
+- Ran the full 13-test suite after each fix. All 13 pass now.
+- For Bug 2, I cross-checked my 30-minute threshold against a comment in `seed_data.py` that says *"Recent events (within the past 30 minutes) — should appear in 'listening now'"*.
+
+The workflow that worked: read the code myself → form a hypothesis → have Claude confirm the trace → apply the fix → run the tests.
+
+---
+
 ## Root Cause Analyses
 
 ### Bug 1 — My listening streak keeps resetting
